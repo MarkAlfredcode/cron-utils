@@ -1,16 +1,26 @@
 name: Usage window ping
 
 on:
-  # Hourly. Off the top of the hour because GitHub delays or drops
-  # scheduled runs most often at :00, when load is heaviest.
-  # Each run sends one tiny Haiku message on CLAUDE_CODE_OAUTH_TOKEN so a
-  # 5-hour Claude usage window is always open. If one is already open,
-  # the message is a harmless no-op.
+  # Sends one tiny Haiku message per Claude account (see the matrix below)
+  # about once an hour, so each account's 5-hour usage window is always
+  # open. If one is already open, the message is a harmless no-op.
+  #
+  # GitHub silently drops most scheduled runs on quiet repos: on an hourly
+  # cron this only fired every 4-10 hours. So it triggers every 5 minutes
+  # (GitHub's minimum) and the gate step skips the ping unless the last
+  # successful one for that account was over 55 minutes ago. Off :00
+  # because that's when GitHub drops the most.
+  #
   # Public repo, so Actions minutes are free and don't touch dc-record's
   # 2,000-minute allowance.
   schedule:
-    - cron: "17 * * * *"
-  workflow_dispatch: {}
+    - cron: "2-59/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Ping even if one went out in the last 55 minutes
+        type: boolean
+        default: false
 
 concurrency:
   group: window-ping
@@ -18,36 +28,84 @@ concurrency:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   ping:
+    # One leg per Claude account: personal = CLAUDE_CODE_OAUTH_TOKEN,
+    # work = CLAUDE_CODE_OAUTH_TOKEN_WORK (skipped if that secret is unset).
+    strategy:
+      fail-fast: false
+      matrix:
+        account: [personal, work]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Each successful ping uploads a last-ping-<account> artifact; its
+      # creation time is the "last pinged" timestamp.
+      - name: Gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_WORK_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_WORK != '' }}
+        run: |
+          if [ "${{ matrix.account }}" = work ] && [ "$HAS_WORK_TOKEN" != true ]; then
+            echo "CLAUDE_CODE_OAUTH_TOKEN_WORK not set, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "${{ inputs.force }}" != true ]; then
+            last=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-ping-${{ matrix.account }}&per_page=1" \
+              --jq '.artifacts[0].created_at // empty')
+            if [ -n "$last" ]; then
+              age=$(( $(date +%s) - $(date -d "$last" +%s) ))
+              if [ "$age" -lt $((55*60)) ]; then
+                echo "last ping $((age/60)) min ago, skipping"
+                echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+              fi
+              echo "last ping $((age/60)) min ago"
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: Install Claude Code
+        if: steps.gate.outputs.skip == 'false'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Ping
+        if: steps.gate.outputs.skip == 'false'
         env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ matrix.account == 'work' && secrets.CLAUDE_CODE_OAUTH_TOKEN_WORK || secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
-          echo "Reply with just: ok" | \
+          if ! echo "Reply with just: ok" | \
             claude -p \
-              --model claude-haiku-4-5-20251001 \
+              --model haiku \
               --max-turns 1 \
-              --output-format json > ping_result.json
+              --output-format json > ping_result.json; then
+            echo "claude exited non-zero, output was:"
+            cat ping_result.json
+            exit 1
+          fi
           jq -r '"result=" + (.result|tostring) + "  cost_usd=" + (.total_cost_usd|tostring)' ping_result.json
+          date -u +%FT%TZ > last_ping.txt
+
+      - name: Record ping
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: last-ping-${{ matrix.account }}
+          path: last_ping.txt
+          retention-days: 1
 
       # GitHub disables scheduled workflows in a public repo after 60 days
       # with no commits. Push an empty commit whenever the newest one is
       # over 30 days old, so the schedule never lapses.
       - name: Keepalive
-        if: always()
-        uses: actions/checkout@v4
+        if: always() && matrix.account == 'personal'
+        uses: actions/checkout@v7
       - name: Keepalive commit
-        if: always()
+        if: always() && matrix.account == 'personal'
         run: |
           age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
           if [ "$age" -gt $((30*86400)) ]; then
