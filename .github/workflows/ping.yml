@@ -5,33 +5,52 @@ on:
   # about once an hour, so each account's 5-hour usage window is always
   # open. If one is already open, the message is a harmless no-op.
   #
-  # GitHub silently drops most scheduled runs on quiet repos: on an hourly
-  # cron this only fired every 4-10 hours. So it triggers every 5 minutes
-  # (GitHub's minimum) and the gate step skips the ping unless the last
-  # successful one for that account was over 55 minutes ago. Off :00
-  # because that's when GitHub drops the most.
+  # GitHub silently drops most scheduled runs on quiet repos (an hourly
+  # cron fired only every 4-10 hours), so the schedule is just a fallback.
+  # The real clock is a self-chaining loop: every run ends by dispatching
+  # the next one (workflow_dispatch is the one event GITHUB_TOKEN may
+  # trigger), and that chained run first waits on the "hourly"
+  # environment, whose 55-minute wait timer holds it without using a
+  # runner. If the chain ever breaks, the next scheduled run that GitHub
+  # does fire restarts it. Off :00 because that's when GitHub drops most.
   #
   # Public repo, so Actions minutes are free and don't touch dc-record's
   # 2,000-minute allowance.
   schedule:
-    - cron: "2-59/5 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
+      chained:
+        description: Wait for the hourly timer first (set by the loop itself)
+        type: boolean
+        default: false
       force:
-        description: Ping even if one went out in the last 55 minutes
+        description: Ping even if one went out in the last 50 minutes
         type: boolean
         default: false
 
+# At most one run in progress and one pending; a newer pending run
+# replaces the older one, so the chain and the fallback can't pile up.
 concurrency:
   group: window-ping
   cancel-in-progress: false
 
 permissions:
   contents: write
-  actions: read
+  actions: write
 
 jobs:
+  wait:
+    if: inputs.chained
+    environment: hourly
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: echo "hourly timer elapsed"
+
   ping:
+    needs: wait
+    if: ${{ !cancelled() && needs.wait.result != 'failure' }}
     # One leg per Claude account: personal = CLAUDE_CODE_OAUTH_TOKEN,
     # work = CLAUDE_CODE_OAUTH_TOKEN_WORK (skipped if that secret is unset).
     strategy:
@@ -42,7 +61,8 @@ jobs:
     timeout-minutes: 5
     steps:
       # Each successful ping uploads a last-ping-<account> artifact; its
-      # creation time is the "last pinged" timestamp.
+      # creation time is the "last pinged" timestamp. Stops a fallback run
+      # from pinging right after a chained one did.
       - name: Gate
         id: gate
         env:
@@ -58,7 +78,7 @@ jobs:
               --jq '.artifacts[0].created_at // empty')
             if [ -n "$last" ]; then
               age=$(( $(date +%s) - $(date -d "$last" +%s) ))
-              if [ "$age" -lt $((55*60)) ]; then
+              if [ "$age" -lt $((50*60)) ]; then
                 echo "last ping $((age/60)) min ago, skipping"
                 echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
               fi
@@ -100,7 +120,7 @@ jobs:
 
       # GitHub disables scheduled workflows in a public repo after 60 days
       # with no commits. Push an empty commit whenever the newest one is
-      # over 30 days old, so the schedule never lapses.
+      # over 30 days old, so the fallback schedule never lapses.
       - name: Keepalive
         if: always() && matrix.account == 'personal'
         uses: actions/checkout@v7
@@ -116,3 +136,15 @@ jobs:
           else
             echo "newest commit is $((age/86400)) days old, no keepalive needed"
           fi
+
+  # Runs even if a ping failed, so one bad token never breaks the loop.
+  next:
+    needs: ping
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Dispatch the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ping.yml -R "${{ github.repository }}" --ref "${{ github.ref_name }}" -f chained=true
