@@ -2,30 +2,49 @@ name: Usage window ping
 
 on:
   # Sends one tiny Haiku message per Claude account (see the matrix below)
-  # about once an hour, so each account's 5-hour usage window is always
-  # open. If one is already open, the message is a harmless no-op.
+  # about once an hour, at :45 UTC, so each account's 5-hour usage window
+  # reopens as soon as the last one ends. A ping inside an open window is
+  # a harmless no-op.
+  #
+  # Phase control: DC Record runs at 14:00 and 22:45 UTC (7:00am / 3:45pm
+  # PDT). A window resets 5h after the ping that opened it, so to have
+  # resets land exactly 1h after each run starts, a window must open at
+  # 10:00 UTC (resets 15:00) and at 18:45 UTC (resets 23:45). That means
+  # no window may be opened inside QUIET hours, or it would still be
+  # running at the next anchor and shift everything after it:
+  #
+  #   quiet 05:00-10:00 UTC (10:00 anchor): a window opened here ends
+  #                          after 10:00
+  #   quiet 13:45-18:45 UTC (18:45 anchor): the idle gap after the 15:00
+  #                          reset until the PM window opens (3h45m, the
+  #                          unavoidable cost: the runs are 8h45m apart)
+  #
+  # Ping times: every :45 plus an extra 10:00 anchor. Pings in quiet hours
+  # are skipped. Revisit at the Nov 1 DST change along with the
+  # dc-record-scheduler crons (PST: runs 15:00 / 23:45 UTC, so anchors
+  # 11:00 / 19:45, quiet 06:00-11:00 / 14:45-19:45).
   #
   # GitHub silently drops most scheduled runs on quiet repos (an hourly
   # cron fired only every 4-10 hours), so the schedule is just a fallback.
   # The real clock is a self-chaining loop: every run ends by dispatching
   # the next one (workflow_dispatch is the one event GITHUB_TOKEN may
-  # trigger), and that chained run first waits on the "hourly"
-  # environment, whose 55-minute wait timer holds it without using a
-  # runner. If the chain ever breaks, the next scheduled run that GitHub
-  # does fire restarts it. Off :00 because that's when GitHub drops most.
+  # trigger), and that chained run first sleeps on a runner until the next
+  # ping time. If the chain ever breaks, the next scheduled run that
+  # GitHub does fire restarts it. Off :00 because that's when GitHub drops
+  # most.
   #
-  # Public repo, so Actions minutes are free and don't touch dc-record's
-  # 2,000-minute allowance.
+  # Public repo, so Actions minutes are free (sleeping included) and don't
+  # touch dc-record's 2,000-minute allowance.
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       chained:
-        description: Wait for the hourly timer first (set by the loop itself)
+        description: Sleep until the next ping time first (set by the loop itself)
         type: boolean
         default: false
       force:
-        description: Ping even if one went out in the last 50 minutes
+        description: Ping now, ignoring quiet hours and the 50-minute guard
         type: boolean
         default: false
 
@@ -42,11 +61,19 @@ permissions:
 jobs:
   wait:
     if: inputs.chained
-    environment: hourly
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 70
     steps:
-      - run: echo "hourly timer elapsed"
+      - name: Sleep until the next ping time (:45, or the 10:00 UTC anchor)
+        run: |
+          now=$(date +%s)
+          wake=$(( now / 3600 * 3600 + 2700 ))
+          [ "$wake" -le $((now + 5)) ] && wake=$((wake + 3600))
+          anchor=$(date -u -d "today 10:00" +%s)
+          [ "$anchor" -le $((now + 5)) ] && anchor=$((anchor + 86400))
+          [ "$anchor" -lt "$wake" ] && wake=$anchor
+          echo "sleeping $(( (wake - now) / 60 )) min until $(date -u -d @$wake +%FT%TZ)"
+          sleep $((wake - now))
 
   ping:
     needs: wait
@@ -74,6 +101,12 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
           if [ "${{ inputs.force }}" != true ]; then
+            # Quiet hours (UTC minutes of day): see the header comment.
+            m=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
+            if { [ "$m" -gt 300 ] && [ "$m" -lt 600 ]; } || { [ "$m" -gt 825 ] && [ "$m" -lt 1125 ]; }; then
+              echo "quiet hours ($(date -u +%H:%M) UTC), skipping"
+              echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
             last=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-ping-${{ matrix.account }}&per_page=1" \
               --jq '.artifacts[0].created_at // empty')
             if [ -n "$last" ]; then
